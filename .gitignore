@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Build artifacts
+build/
+*.prg
+*.d64
+*.asm
+*.int
+*.lbl
+*.map
+!artifacts/
+!artifacts/player.prg
+
+# Local MIDI files used for tests
+*.mid
+*.midi
+
+# Emulator snapshots/state
+*.vsf
+*.vkm

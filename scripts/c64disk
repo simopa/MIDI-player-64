@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+BUILD_DIR="$ROOT_DIR/build"
+PLAYER_PRG_BUILD="$BUILD_DIR/player.prg"
+PLAYER_PRG_ARTIFACT="$ROOT_DIR/artifacts/player.prg"
+PLAYER_PRG=""
+DISK_IMAGE="$BUILD_DIR/midi-player-64.d64"
+SELECT_ARG="${1:-}"
+
+mkdir -p "$BUILD_DIR"
+
+C1541="${C1541:-$(command -v c1541 2>/dev/null || true)}"
+if [[ -z "$C1541" ]]; then
+	for p in \
+		/Applications/VICE/bin/c1541 \
+		/usr/local/bin/c1541 \
+		/opt/homebrew/bin/c1541 \
+		"$HOME/Documents/C64/Emulatori/Vice/vice-arm64-gtk3-3.10/bin/c1541"; do
+		if [[ -x "$p" ]]; then
+			C1541="$p"
+			break
+		fi
+	done
+fi
+if [[ -z "$C1541" ]]; then
+	echo "c1541 not found. Install VICE or set C1541=/path/to/c1541"
+	exit 1
+fi
+
+if [[ -f "$PLAYER_PRG_BUILD" ]]; then
+	PLAYER_PRG="$PLAYER_PRG_BUILD"
+elif [[ -f "$PLAYER_PRG_ARTIFACT" ]]; then
+	PLAYER_PRG="$PLAYER_PRG_ARTIFACT"
+else
+	echo "Pre-compiled player not found."
+	echo "Tried:"
+	echo " - $PLAYER_PRG_BUILD"
+	echo " - $PLAYER_PRG_ARTIFACT"
+	echo "Run ./c64build once to generate it."
+	exit 1
+fi
+
+shopt -s nullglob nocaseglob
+MID_FILES=( "$ROOT_DIR"/*.mid "$ROOT_DIR"/*.midi )
+shopt -u nocaseglob
+
+if [[ "$SELECT_ARG" == "--help" || "$SELECT_ARG" == "-h" ]]; then
+	echo "Usage:"
+	echo "  ./c64disk                # show MIDI selection menu and create d64"
+	echo "  ./c64disk <index>        # pick MIDI by 1-based index"
+	echo "  ./c64disk <filename.mid> # pick MIDI by filename"
+	exit 0
+fi
+
+SELECTED_MID_FILES=()
+if (( ${#MID_FILES[@]} == 0 )); then
+	echo "No .mid/.midi found in $ROOT_DIR"
+	exit 1
+fi
+
+if [[ -n "$SELECT_ARG" ]]; then
+	if [[ "$SELECT_ARG" =~ ^[0-9]+$ ]] && (( SELECT_ARG >= 1 && SELECT_ARG <= ${#MID_FILES[@]} )); then
+		SELECTED_MID_FILES=( "${MID_FILES[$((SELECT_ARG - 1))]}" )
+	else
+		found=0
+		for f in "${MID_FILES[@]}"; do
+			if [[ "$SELECT_ARG" == "$(basename "$f")" || "$SELECT_ARG" == "$f" ]]; then
+				SELECTED_MID_FILES=( "$f" )
+				found=1
+				break
+			fi
+		done
+		if (( found == 0 )); then
+			echo "Invalid MIDI selection: $SELECT_ARG"
+			exit 1
+		fi
+	fi
+else
+	echo "MIDI files found in project folder:"
+	for i in "${!MID_FILES[@]}"; do
+		printf " %2d) %s\n" "$((i + 1))" "$(basename "${MID_FILES[$i]}")"
+	done
+
+	if [[ ! -t 0 ]]; then
+		echo "No interactive input available. Use: ./c64disk <index|filename.mid>"
+		exit 1
+	fi
+
+	while true; do
+		read -r -p "Choose MIDI to include (1-${#MID_FILES[@]}) [1]: " choice
+		choice="${choice:-1}"
+		if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#MID_FILES[@]} )); then
+			SELECTED_MID_FILES=( "${MID_FILES[$((choice - 1))]}" )
+			break
+		fi
+		echo "Invalid choice, retry."
+	done
+fi
+
+"$C1541" \
+	-format "midi sid player,ms" d64 "$DISK_IMAGE" \
+	-write "$PLAYER_PRG" "player" \
+	-write "${SELECTED_MID_FILES[0]}" "midi"
+
+echo ""
+echo "Disk OK:  $DISK_IMAGE"
+echo "MIDI:     $(basename "${SELECTED_MID_FILES[0]}")"
+echo "PLAYER:   $PLAYER_PRG"
+echo "Launch:   LOAD\"*\",8,1 then RUN"
