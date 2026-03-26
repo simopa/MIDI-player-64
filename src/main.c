@@ -30,11 +30,12 @@
 #define DIR_FNUM 3
 
 /* All event storage is pre-allocated statically because the C64 has no
- * usable malloc. 2800 events * 7 bytes each is ~19 KB, leaving enough
- * room for code, stack, and the SID frequency table. */
+ * usable malloc. Event times are stored in 24-bit form so each note event
+ * costs 5 bytes total (time24 + cmd + note). */
 
-#define MAX_EVENTS 3150
+#define MAX_EVENTS 3780
 #define MAX_TEMPO_EVENTS 128
+#define EVENT_TIME_MAX 0x00ffffffUL
 
 /* Type 1 MIDI files split instruments across tracks. Only tracks with
  * a reasonable number of note-on events are kept -- too few means it's
@@ -88,13 +89,19 @@ typedef struct voice_state {
     uint16_t    age;      /* monotonic counter for voice stealing */
 } voice_state;
 
+typedef struct event_time24 {
+    uint8_t lo;
+    uint8_t mid;
+    uint8_t hi;
+} event_time24;
+
 /* ============================= Global state =============================== */
 
 /* Events are stored in parallel arrays rather than an array of structs
  * because oscar64 generates tighter code for indexed access this way,
  * and on the 6502 every cycle counts. */
 
-static uint32_t event_time[MAX_EVENTS];
+static event_time24 event_time[MAX_EVENTS];
 static uint8_t  event_cmd[MAX_EVENTS];
 static uint8_t  event_note[MAX_EVENTS];
 __zeropage static uint16_t event_count;
@@ -200,13 +207,29 @@ static void reset_conversion_state(void) {
     io_len = 0;
 }
 
+static uint32_t event_time_get(const event_time24 * t) {
+    return (uint32_t)t->lo | ((uint32_t)t->mid << 8) | ((uint32_t)t->hi << 16);
+}
+
+static bool event_time_set(event_time24 * t, uint32_t v) {
+    if (v > EVENT_TIME_MAX)
+        return false;
+    t->lo = (uint8_t)(v & 0xff);
+    t->mid = (uint8_t)((v >> 8) & 0xff);
+    t->hi = (uint8_t)((v >> 16) & 0xff);
+    return true;
+}
+
 static bool push_note_event(uint32_t tick, uint8_t cmd, uint8_t note) {
     if (event_count >= MAX_EVENTS) {
         event_overflow = true;
         return false;
     }
 
-    event_time[event_count] = tick;
+    if (!event_time_set(&event_time[event_count], tick)) {
+        event_overflow = true;
+        return false;
+    }
     event_cmd[event_count] = cmd;
     event_note[event_count] = note;
     event_count++;
@@ -806,11 +829,15 @@ static load_result parse_track_events(FILE * fp, uint32_t track_len, uint16_t * 
  * Otherwise we'd release a voice and immediately re-trigger it on the
  * same frame, causing audible clicks. */
 
-static bool note_event_before(uint32_t ta, uint8_t ca, uint32_t tb, uint8_t cb) {
+static bool note_event_before(const event_time24 * ta, uint8_t ca, const event_time24 * tb, uint8_t cb) {
     uint8_t ma, mb;
 
-    if (ta != tb)
-        return ta < tb;
+    if (ta->hi != tb->hi)
+        return ta->hi < tb->hi;
+    if (ta->mid != tb->mid)
+        return ta->mid < tb->mid;
+    if (ta->lo != tb->lo)
+        return ta->lo < tb->lo;
 
     ma = ca & 0xf0;
     mb = cb & 0xf0;
@@ -832,12 +859,12 @@ static void sort_note_events(void) {
 
     for (gap = event_count >> 1; gap > 0; gap >>= 1) {
         for (i = gap; i < event_count; ++i) {
-            uint32_t tt = event_time[i];
+            event_time24 tt = event_time[i];
             uint8_t tc = event_cmd[i];
             uint8_t tn = event_note[i];
 
             j = i;
-            while (j >= gap && note_event_before(tt, tc, event_time[j - gap], event_cmd[j - gap])) {
+            while (j >= gap && note_event_before(&tt, tc, &event_time[j - gap], event_cmd[j - gap])) {
                 event_time[j] = event_time[j - gap];
                 event_cmd[j] = event_cmd[j - gap];
                 event_note[j] = event_note[j - gap];
@@ -916,7 +943,7 @@ static void convert_ticks_to_frames(void) {
     }
 
     for (uint16_t i = 0; i < event_count; ++i) {
-        uint32_t target_tick = event_time[i];
+        uint32_t target_tick = event_time_get(&event_time[i]);
 
         while (ti < tempo_count && tempo_tick[ti] <= target_tick) {
             uint32_t tempo_tick_now = tempo_tick[ti];
@@ -928,17 +955,23 @@ static void convert_ticks_to_frames(void) {
 
         advance_frames_by_ticks(target_tick - cur_tick, tempo_us, &cur_frame, &frame_numer);
         cur_tick = target_tick;
-        event_time[i] = cur_frame;
+        if (!event_time_set(&event_time[i], cur_frame)) {
+            event_count = i;
+            event_overflow = true;
+            break;
+        }
     }
 
     song_length_frames = cur_frame;
 
     /* Many MIDI files have silence at the beginning (count-in, empty
      * first measure). Strip it so playback starts immediately. */
-    if (event_count > 0 && event_time[0] > 0) {
-        uint32_t base = event_time[0];
-        for (uint16_t i = 0; i < event_count; ++i)
-            event_time[i] -= base;
+    if (event_count > 0 && event_time_get(&event_time[0]) > 0) {
+        uint32_t base = event_time_get(&event_time[0]);
+        for (uint16_t i = 0; i < event_count; ++i) {
+            uint32_t shifted = event_time_get(&event_time[i]) - base;
+            event_time_set(&event_time[i], shifted);
+        }
         if (song_length_frames > base)
             song_length_frames -= base;
         else
@@ -1323,7 +1356,7 @@ static play_result play_events(void) {
         return PLAY_FINISHED;
 
     while (idx < event_count) {
-        while (idx < event_count && event_time[idx] <= frame) {
+        while (idx < event_count && event_time_get(&event_time[idx]) <= frame) {
             process_event(event_cmd[idx], event_note[idx]);
             idx++;
         }
